@@ -14,9 +14,5 @@ target_sources(animation PRIVATE animation.c vga_graphics.c)
 target_link_libraries(animation PRIVATE pico_stdlib pico_divider pico_multicore pico_bootsel_via_double_reset hardware_pio hardware_dma hardware_adc hardware_irq hardware_clocks hardware_pll)
 
 
-pico_enable_stdio_usb(animation 1)
-pico_enable_stdio_uart(animation 0)
-
-
 # must match with executable name
 pico_add_extra_outputs(animation)

@@ -40,11 +40,8 @@
 
 // Include protothreads
 #include "pt_cornell_rp2040_v1.h"
-
- #define maxspeed 6
- #define minspeed 3
-
  volatile int frame_counter = 0;
+
 
 // === the fixed point macros ========================================
 typedef signed int fix15 ;
@@ -63,6 +60,25 @@ typedef signed int fix15 ;
 #define hitLeft(a) (a<int2fix15(100))
 #define hitRight(a) (a>int2fix15(540))
 
+spin_lock_t * lock_update;
+
+float bias = 0.001;
+fix15 turn_factor = float2fix15(0.2);
+fix15 visual_range = float2fix15(40);
+fix15 protected_range = float2fix15(8);
+fix15 centering_factor = float2fix15(0.0005);
+fix15 avoid_factor = float2fix15(0.05);
+fix15 matching_factor = float2fix15(0.05);
+fix15 max_bias = float2fix15(0.01);
+fix15 bias_increment = float2fix15(0.00004);
+fix15 biasval = float2fix15(0.001);
+fix15 maxspeed = int2fix15(6);
+fix15 minspeed = int2fix15(3);
+fix15 zero_point_4 = float2fix15(0.4) ;
+#define num_boids 700
+
+
+
 #define BOTTOM int2fix15(380)
 #define TOP int2fix15(100)
 #define LEFT int2fix15(100)
@@ -71,29 +87,25 @@ typedef signed int fix15 ;
 // uS per frame
 #define FRAME_RATE 33000
 
-fix15 turn_factor = float2fix15(1) ;
-
 struct boid{
   fix15 x;
   fix15 y;
   fix15 vx;
   fix15 vy;
+  fix15 sg;
+  fix15 bias;
 };
 
 // the color of the boid
 char color = WHITE ;
 
-// Boid on core 0
-fix15 boid0_x ;
-fix15 boid0_y ;
-fix15 boid0_vx ;
-fix15 boid0_vy ;
+int sg1;
+int sg2;
+int sg3;
 
-// Boid on core 1
-fix15 boid1_x ;
-fix15 boid1_y ;
-fix15 boid1_vx ;
-fix15 boid1_vy ;
+static struct boid swarm[num_boids];
+
+int top = 100, bottom = 380, right = 540, left = 100;
 
 // Create a boid
 void spawnBoid(struct boid* swarm, int num, int direction)
@@ -101,33 +113,52 @@ void spawnBoid(struct boid* swarm, int num, int direction)
   for (int i = 0; i<num; i++){
     swarm[i].x = int2fix15(100 + rand()%540 + 1) ;
     swarm[i].y = int2fix15(100 + rand()%380 + 1) ;
-    if (direction) swarm[i].vx = int2fix15(minspeed + rand()%(maxspeed-minspeed)) ;
-    else swarm[i].vx = int2fix15(-1*(minspeed + rand()%(maxspeed-minspeed))) ;
-    swarm[i].vy = int2fix15(minspeed + rand()%(maxspeed-minspeed));
+    if (direction) swarm[i].vx = int2fix15(5) ;
+    else swarm[i].vx = int2fix15(-1*(5)) ;
+    swarm[i].vy = int2fix15(5);
+    swarm[i].bias = biasval;
+    if (i<num/3) swarm[i].sg = int2fix15(1);
+    else if (i<2*num/3 && i>num/3) swarm[i].sg = int2fix15(2);
+    else swarm[i].sg = int2fix15(3);
   }
 }
 
 // Draw the boundaries
 void drawArena() {
-  drawVLine(100, 100, 280, WHITE) ;
-  drawVLine(540, 100, 280, WHITE) ;
-  drawHLine(100, 100, 440, WHITE) ;
-  drawHLine(100, 380, 440, WHITE) ;
+  if ((top>10 && bottom<470) && (left>10 && right<630)){
+  drawVLine(left, top, (bottom - top), WHITE) ;
+  drawVLine(right, top, (bottom - top), WHITE) ;
+  drawHLine(left, top, (right - left), WHITE) ;
+  drawHLine(left, bottom, (right - left), WHITE) ;
+  }
+  else if((left>10 && right<630)&&(top<10 && bottom>470)){
+    drawVLine(left, top, 480, WHITE) ;
+    drawVLine(right, top, 480, WHITE) ;
+  }
+  else if ((top>10 && bottom<470)&&(left<10 && right>630)){
+    
+    drawHLine(left, top, (right - left), WHITE) ;
+    drawHLine(left, bottom, (right - left), WHITE) ;
+  }
 }
 
 void drawInfo(int spare_time){
- 
+  int s_time;
+ if (spare_time < 0)s_time = 0;
+ else s_time = spare_time;
   static int current_time;
   current_time = (time_us_32()/1000000);
+  static char num_b[20];
+  sprintf(num_b, "Number of Boids: %d", num_boids) ;
   static char freqtext[60];
   sprintf(freqtext, "%d seconds", current_time) ;
   static char timing[40];
-  sprintf(timing, "%d microseconds", spare_time) ;
+  sprintf(timing, "%d microseconds", s_time) ;
   // Write some text to VGA
     setTextColor(WHITE) ;
     setCursor(65, 0) ;
     setTextSize(1) ;
-    writeString("Number of boids : 1") ;
+    writeString(num_b) ;
     setCursor(65, 10) ;
     writeString("Spare Time:") ;
     fillRect(140, 10, 250, 10, BLACK);
@@ -140,46 +171,108 @@ void drawInfo(int spare_time){
     writeString(freqtext) ;
 }
 
-// Detect wallstrikes, update velocity and position
-void wallsAndEdges(fix15 x, fix15 y, fix15 vx, fix15 vy)
-{
-  // Reverse direction if we've hit a wall
-  if (hitTop(*y)) {
-    *vy = (*vy + turn_factor) ;
-    //*y  = (*y + int2fix15(5)) ;
-  }
-  if (hitBottom(*y)) {
-    *vy = (*vy - turn_factor) ;
-    //*y  = (*y - int2fix15(5)) ;
-  } 
-  if (hitRight(*x)) {
-    *vx = (*vx - turn_factor) ;
-    //*x  = (*x - int2fix15(5)) ;
-  }
-  if (hitLeft(*x)) {
-    *vx = (*vx + turn_factor) ;
-    //*x  = (*x + int2fix15(5)) ;
-  } 
-  /*if (abs(*vx)>maxspeed){
-    if (*vx>0) *vx = maxspeed;
-    else *vx = -maxspeed;
-  }
-  if (abs(*vy)>maxspeed){
-    if (*vy>0) *vy = maxspeed;
-    else *vy = -maxspeed;
-  }
-  if (abs(*vx)<minspeed){
-    if (*vx>0) *vx = minspeed;
-    else *vx = -minspeed;
-  }
-  if (abs(*vy)<minspeed){
-    if (*vy>0) *vy = minspeed;
-    else *vy = -minspeed;
-  }*/
+void update_boid(struct boid* swarm,int begin, int end, int num){
+  for (int i = begin; i<end; i++){
+    //erase old boid
+    drawRect(fix2int15(swarm[i].x), fix2int15(swarm[i].y), 2, 2, BLACK);
+    if(swarm[i].y >= int2fix15(479) && (top==0 && bottom == 480) ){
+      swarm[i].y = swarm[i].y - int2fix15(479);
+    }
+    if(swarm[i].y <= int2fix15(0) && (top==0 && bottom == 480)){
+      swarm[i].y = swarm[i].y + int2fix15(479);
+    }
+    if(swarm[i].x >= int2fix15(639) && (left==0 && right == 640)){
+      swarm[i].x = swarm[i].x - int2fix15(639);
+    }
+    if(swarm[i].x <= int2fix15(0) && (left==0 && right == 640)){
+      swarm[i].x = swarm[i].x + int2fix15(639);
+    }
+    fix15 xpos_avg = 0, ypos_avg = 0, xvel_avg = 0, yvel_avg = 0, neighboring_boids = 0, close_dx = 0, close_dy = 0;
+    for (int j = 0; j<num; j++){
+    if (j!=i){
+      fix15 dx = swarm[i].x - swarm[j].x;
+      fix15 dy = swarm[i].y - swarm[j].y;
+      if (absfix15(dx)<visual_range && absfix15(dy)<visual_range){
+        fix15 squared_dist = multfix15(dx,dx) + multfix15(dy,dy);
+        if (squared_dist<multfix15(protected_range,protected_range)){
+          close_dx += swarm[i].x - swarm[j].x;
+          close_dy += swarm[i].y - swarm[j].y;
+        }
+        else if (squared_dist<multfix15(visual_range,visual_range)){
+          xpos_avg += swarm[j].x;
+          ypos_avg += swarm[j].y;
+          xvel_avg += swarm[j].vx;
+          yvel_avg += swarm[j].vy;
+          neighboring_boids += 1;
+        }
+      }
+    }
+    }
+    if (neighboring_boids>0){
+      xpos_avg = (xpos_avg/neighboring_boids);
+      ypos_avg = (ypos_avg/neighboring_boids);
+      xvel_avg = (xvel_avg/neighboring_boids);
+      yvel_avg = (yvel_avg/neighboring_boids);
+
+      swarm[i].vx = (swarm[i].vx + multfix15((xpos_avg - swarm[i].x),centering_factor) + 
+                   multfix15((xvel_avg - swarm[i].vx),matching_factor));
+      swarm[i].vy = (swarm[i].vy + multfix15((ypos_avg - swarm[i].y),centering_factor) + 
+                   multfix15((yvel_avg - swarm[i].vy),matching_factor));
+    }
+
+    swarm[i].vx = swarm[i].vx + multfix15(close_dx,avoid_factor);
+    swarm[i].vy = swarm[i].vy + multfix15(close_dy,avoid_factor);
+
+
+    if (swarm[i].y<int2fix15(top)) {
+    swarm[i].vy = (swarm[i].vy + turn_factor) ;
+    }
+    if (swarm[i].y>int2fix15(bottom)) {
+      swarm[i].vy = (swarm[i].vy - turn_factor) ;
+    } 
+    if (swarm[i].x>int2fix15(right)) {
+      swarm[i].vx = (swarm[i].vx - turn_factor) ;
+    }
+    if(swarm[i].x<int2fix15(left)) {
+      swarm[i].vx = (swarm[i].vx + turn_factor) ;
+    }
+    
+    swarm[i].bias = biasval;
+
+    if (swarm[i].sg == int2fix15(1)){
+      if (swarm[i].vx > 0) swarm[i].bias = fmin(max_bias, swarm[i].bias + bias_increment);
+      else swarm[i].bias = fmax(bias_increment, swarm[i].bias - bias_increment);
+      swarm[i].vx = multfix15((int2fix15(1) - swarm[i].bias),swarm[i].vx) + swarm[i].bias;
+    }
+
+    if (swarm[i].sg == int2fix15(2)){
+      if (swarm[i].vx < 0) swarm[i].bias = fmin(max_bias, swarm[i].bias + bias_increment);
+      else swarm[i].bias = fmax(bias_increment, swarm[i].bias + bias_increment);
+      swarm[i].vx = multfix15((int2fix15(1) - swarm[i].bias),swarm[i].vx) - swarm[i].bias;
+    }
+
+    fix15 speed = fmax(absfix15(swarm[i].vx),absfix15(swarm[i].vy)) + multfix15(zero_point_4,fmin(absfix15(swarm[i].vx),absfix15(swarm[i].vy)));
   
-  // Update position using velocity
-  *x = *x + *vx ;
-  *y = *y + *vy ;
+
+    if (speed < minspeed){
+        swarm[i].vx = multfix15(divfix(swarm[i].vx,speed),minspeed);
+        swarm[i].vy = multfix15(divfix(swarm[i].vy,speed),minspeed);
+    }
+    if (speed > maxspeed){
+        swarm[i].vx = multfix15(divfix(swarm[i].vx,speed),maxspeed);
+        swarm[i].vy = multfix15(divfix(swarm[i].vy,speed),maxspeed);
+    }
+    //printf("Update0: %d,%d,%d,%d\n",fix2int15(swarm[i].x),fix2int15(swarm[i].y),fix2int15(swarm[i].vx),fix2int15(swarm[i].vy));
+
+    swarm[i].x = swarm[i].x + swarm[i].vx;
+    swarm[i].y = swarm[i].y + swarm[i].vy;
+
+    //draw boid at updated position
+    if (swarm[i].sg == int2fix15(1))drawRect(fix2int15(swarm[i].x), fix2int15(swarm[i].y), 2, 2, WHITE);
+    else if (swarm[i].sg == int2fix15(2))drawRect(fix2int15(swarm[i].x), fix2int15(swarm[i].y), 2, 2, RED);
+    else drawRect(fix2int15(swarm[i].x), fix2int15(swarm[i].y), 2, 2, BLUE);
+
+  }
 }
 
 // ==================================================
@@ -196,18 +289,37 @@ static PT_THREAD (protothread_serial(struct pt *pt))
     sprintf(pt_serial_out_buffer, "Protothreads RP2040 v1.0\n\r");
     // non-blocking write
     serial_write ;
+    static int top_old, bottom_old, right_old,left_old;
       while(1) {
         // print prompt
-        sprintf(pt_serial_out_buffer, "input a number in the range 1-7: ");
+        sprintf(pt_serial_out_buffer, "Enter:");
         // non-blocking write
         serial_write ;
+        top_old = top;
+        bottom_old = bottom;
+        right_old = right;
+        left_old = left;
         // spawn a thread to do the non-blocking serial read
         serial_read ;
         // convert input string to number
-        sscanf(pt_serial_in_buffer,"%d", &user_input) ;
+        sscanf(pt_serial_in_buffer,"%d,%d,%d,%d,%f,%d,%d,%d", &top, &bottom, &right, &left, &bias, &sg1, &sg2, &sg3) ;
+        biasval = float2fix15(bias);
+        
         // update boid color
-        if ((user_input > 0) && (user_input < 8)) {
-          color = (char)user_input ;
+        if (pt_serial_in_buffer){
+          for (int i = 0; i<sg1; i++){
+          swarm[i].sg = int2fix15(1);
+        }
+        for (int i = sg1; i<sg2; i++){
+          swarm[i].sg = int2fix15(2);
+        }
+        for (int i = sg2; i<sg3; i++){
+          swarm[i].sg = int2fix15(3);
+        }
+          drawVLine(left_old, top_old, (bottom_old - top_old), BLACK) ;
+          drawVLine(right_old, top_old, (bottom_old - top_old), BLACK) ;
+          drawHLine(left_old, top_old, (right_old - left_old), BLACK) ;
+          drawHLine(left_old, bottom_old, (right_old - left_old), BLACK) ;
         }
       } // END WHILE(1)
   PT_END(pt);
@@ -222,20 +334,16 @@ static PT_THREAD (protothread_anim(struct pt *pt))
     // Variables for maintaining frame rate
     static int begin_time ;
     static int spare_time ;
-    struct boid swarm[10];
+    
     // Spawn a boid
-    spawnBoid(swarm, 10, 0);
+    spawnBoid(swarm, num_boids, 0);
 
     while(1) {
-      for (int i = 0; i<10; i++){
         // Measure time at start of thread
-        begin_time = time_us_32() ;      
-        // erase boid
-        drawRect(fix2int15(swarm[i].x), fix2int15(swarm[i].y), 2, 2, BLACK);
-        // update boid's position and velocity
-        wallsAndEdges(swarm[i].x, swarm[i].y, swarm[i].vx, swarm[i].vy) ;
-        // draw the boid at its new position
-        drawRect(fix2int15(swarm[i].x), fix2int15(swarm[i].y), 2, 2, color); 
+        begin_time = time_us_32() ;
+        PT_LOCK_WAIT(pt, lock_update) ;
+        update_boid(swarm, 0, num_boids/2, num_boids);
+        PT_LOCK_RELEASE(lock_update);
         // draw the boundaries
         drawArena() ;
         // delay in accordance with frame rate
@@ -244,7 +352,7 @@ static PT_THREAD (protothread_anim(struct pt *pt))
         // yield for necessary amount of time
         PT_YIELD_usec(spare_time) ;
       // NEVER exit while
-    } // END WHILE(1)
+      // END WHILE(1)
     }
   PT_END(pt);
 } // animation thread
@@ -260,23 +368,19 @@ static PT_THREAD (protothread_anim1(struct pt *pt))
     static int begin_time ;
     static int spare_time ;
 
-    // Spawn a boid
-    spawnBoid(&boid1_x, &boid1_y, &boid1_vx, &boid1_vy, 1);
-
     while(1) {
-      // Measure time at start of thread
-      begin_time = time_us_32() ;      
-      // erase boid
-      drawRect(fix2int15(boid1_x), fix2int15(boid1_y), 2, 2, BLACK);
-      // update boid's position and velocity
-      wallsAndEdges(&boid1_x, &boid1_y, &boid1_vx, &boid1_vy) ;
-      // draw the boid at its new position
-      drawRect(fix2int15(boid1_x), fix2int15(boid1_y), 2, 2, color); 
-      // delay in accordance with frame rate
-      spare_time = FRAME_RATE - (time_us_32() - begin_time) ;
-      // yield for necessary amount of time
-      PT_YIELD_usec(spare_time) ;
-     // NEVER exit while
+      begin_time = time_us_32() ;   
+        // update boid's position and velocity
+        PT_LOCK_WAIT(pt, lock_update) ;
+        update_boid(swarm, num_boids/2, num_boids, num_boids);
+        PT_LOCK_RELEASE(lock_update);
+        // draw the boundaries
+        //drawArena() ;
+        // delay in accordance with frame rate
+        spare_time = FRAME_RATE - (time_us_32() - begin_time) ;
+        //drawInfo(spare_time);
+        // yield for necessary amount of time
+        PT_YIELD_usec(spare_time) ;
     } // END WHILE(1)
   PT_END(pt);
 } // animation thread
@@ -287,6 +391,7 @@ static PT_THREAD (protothread_anim1(struct pt *pt))
 void core1_main(){
   // Add animation thread
   pt_add_thread(protothread_serial);
+  pt_add_thread(protothread_anim1);
   // Start the scheduler
   pt_schedule_start ;
 
@@ -297,6 +402,7 @@ void core1_main(){
 // ========================================
 // USE ONLY C-sdk library
 int main(){
+  set_sys_clock_khz(250000, true);
   // initialize stio
   stdio_init_all() ;
 
@@ -310,6 +416,7 @@ int main(){
 
   // add threads
   pt_add_thread(protothread_anim);
+  
 
   // start scheduler
   pt_schedule_start ;
